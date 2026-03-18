@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI English Tutor</title>
+    <meta name="description" content="Practice your English with an AI-powered speaking coach.">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css?v=updated">
+</head>
+<body>
+    <div class="app-container" id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="logo">
+                <span class="logo-icon">👩‍🏫</span>
+                <span>AI English Tutor</span>
+            </div>
+            <div class="header-right">
+                <div class="status-badge disconnected" id="headerStatus">
+                    <div class="status-dot"></div>
+                    <span id="headerStatusLabel">Offline</span>
+                </div>
+                <div id="modeBadge" style="display:none;"><span id="modeLabel"></span></div>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <!-- Avatar Section -->
+            <div class="avatar-section" id="avatarSection">
+                <div class="avatar-frame">
+                    <canvas id="avatar-canvas" class="avatar-video" width="480" height="480"></canvas>
+                    <audio id="avatarAudio" crossorigin="anonymous" style="display:none;"></audio>
+
+                    <div id="avatarConnecting" class="avatar-placeholder">
+                        <div class="loading-state">
+                            <div class="loading-spinner"></div>
+                            <p>Connecting to avatar...</p>
+                            <p class="loading-hint">Initializing facial expressions & lip sync</p>
+                        </div>
+                    </div>
+
+                    <div class="thinking-badge" id="processingBar">
+                        <div class="thinking-dots">
+                            <span></span><span></span><span></span>
+                        </div>
+                        <span id="processingText">Processing...</span>
+                    </div>
+                </div>
+
+                <div class="avatar-name">
+                    Speaking Coach Monica
+                </div>
+            </div>
+
+            <!-- Chat Section -->
+            <div class="chat-section">
+                <div class="messages-container" id="transcriptBody">
+                    <div class="empty-state" id="transcriptEmpty">
+                        <p>👋 Welcome to <strong>AI English Tutor</strong></p>
+                        <p>Enable your microphone, and begin practicing English!</p>
+                    </div>
+                </div>
+
+                <!-- Input Area -->
+                <div class="input-area" style="flex-wrap: wrap;">
+                    <button class="mic-button" id="micBtn" title="Start listening">
+                        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"></path>
+                            <path d="M19 10v2a7 7 0 0 1-14 0v-2"></path>
+                            <line x1="12" y1="19" x2="12" y2="22"></line>
+                        </svg>
+                        <div id="micRipple" style="display:none;"></div>
+                    </button>
+                    <form class="text-form" onsubmit="event.preventDefault();">
+                        <input type="text" class="text-input" placeholder="Voice interaction active..." disabled />
+                        <button type="button" class="send-button" disabled>
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                        </button>
+                    </form>
+                    <div id="micLabel" style="width: 100%; font-size: 13px; color: var(--text-muted); text-align: left; padding-left: 10px; margin-top: 5px;">Tap to speak</div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script type="module" src="app.js?v=updated"></script>
+</body>
+</html>
