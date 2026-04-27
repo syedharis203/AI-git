@@ -11,10 +11,7 @@
     <meta name="mobile-web-app-capable" content="yes">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=20260319-v4">
-    <!-- Preload the video to avoid first-message lag -->
-    <link rel="preload" href="demo_test_4.mp4" as="video" type="video/mp4">
-    <link rel="preload" href="avatar_idle.png" as="image" type="image/png">
+    <link rel="stylesheet" href="styles.css?v=20260319-v5">
 </head>
 <body>
     <div class="app-container" id="app">
@@ -37,14 +34,16 @@
             <!-- Avatar Section -->
             <div class="avatar-section" id="avatarSection">
                 <div class="avatar-frame">
-                    <canvas id="avatar-canvas" class="avatar-video" width="480" height="480"></canvas>
-                    <audio id="avatarAudio" crossorigin="anonymous" preload="auto" style="display:none;"></audio>
+                    <!-- Simli WebRTC Video — replaces canvas + pre-recorded video -->
+                    <video id="simli-video" class="avatar-video" autoplay playsinline muted></video>
+                    <!-- Simli WebRTC Audio output (separate from video) -->
+                    <audio id="simli-audio" autoplay style="display:none;"></audio>
 
                     <div id="avatarConnecting" class="avatar-placeholder">
                         <div class="loading-state">
                             <div class="loading-spinner"></div>
-                            <p>Connecting to avatar...</p>
-                            <p class="loading-hint">Initializing facial expressions &amp; lip sync</p>
+                            <p>Connecting to Simli avatar...</p>
+                            <p class="loading-hint">Initializing real-time facial expressions &amp; lip sync</p>
                         </div>
                     </div>
 
@@ -92,6 +91,6 @@
         </main>
     </div>
 
-    <script type="module" src="app.js?v=20260319-v4"></script>
+    <script type="module" src="app.js?v=20260319-v5"></script>
 </body>
 </html>
