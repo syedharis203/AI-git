@@ -18,7 +18,7 @@ import AvatarEngine from './avatar-engine.js?v=20260319-v5';
 //  CONFIGURATION
 // ============================================
 const CONFIG = {
-    N8N_WEBHOOK_URL: 'https://n8n.pixonix.tech/webhook-test/chat',
+    N8N_WEBHOOK_URL: 'https://n8n.pixonix.tech/webhook/chat',
 
     // Safari doesn't support opus in webm — use flexible mime detection
     AUDIO_MIME_TYPES: [
