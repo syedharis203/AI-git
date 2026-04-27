@@ -12,13 +12,13 @@
  *   — Unique session IDs prevent caching issues
  */
 
-import AvatarEngine from './avatar-engine.js?v=20260319-v4';
+import AvatarEngine from './avatar-engine.js?v=20260319-v5';
 
 // ============================================
 //  CONFIGURATION
 // ============================================
 const CONFIG = {
-    N8N_WEBHOOK_URL: 'https://n8n.auge10x.com/webhook/chat',
+    N8N_WEBHOOK_URL: 'https://n8n.pixonix.tech/webhook-test/chat',
 
     // Safari doesn't support opus in webm — use flexible mime detection
     AUDIO_MIME_TYPES: [
@@ -35,6 +35,7 @@ const CONFIG = {
     REQUEST_TIMEOUT_MS: 60000,
     RETRY_DELAY_MS: 2000,
     MAX_RETRIES: 1,
+    IDLE_DISCONNECT_MS: 45000, // 45s auto-disconnect for aggressive cost savings
 };
 
 // ============================================
@@ -54,6 +55,9 @@ const state = {
     recognition: null,
     interimMsgEl: null,
     interimTextP: null,
+    idleTimer: null,
+    continuousMode: false,
+    hasSpoken: false,
 };
 
 // ============================================
@@ -121,19 +125,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     preWarmWebhook();
 
-    initAvatarSession({ showUi: false }).then((ok) => {
-        if (ok) console.log('[App] Avatar session auto-started');
-        else console.log('[App] Auto-start deferred');
-    });
+    console.log('[App] Avatar session will lazy-load on first interaction to save cost');
 
     // Handle autoplay policy: resume audio/video on first user interaction
     const resumeOnInteraction = () => {
         if (avatar && typeof avatar.resumePlayback === 'function') {
             avatar.resumePlayback();
-        }
-        // Also resume AudioContext if suspended
-        if (avatar && avatar.audioContext && avatar.audioContext.state === 'suspended') {
-            avatar.audioContext.resume().catch(() => {});
         }
         document.removeEventListener('click', resumeOnInteraction);
         document.removeEventListener('touchstart', resumeOnInteraction);
@@ -194,6 +191,31 @@ function hideProcessing() {
 }
 
 // ============================================
+//  IDLE COST SAVING MANAGER
+// ============================================
+function resetIdleTimer() {
+    if (state.idleTimer) clearTimeout(state.idleTimer);
+    state.idleTimer = setTimeout(() => {
+        if (avatar && state.heygenReady && !state.isSpeaking && !state.isProcessing && !state.isRecording) {
+            console.log('[App] Inactive for 45s. Disconnecting Avatar to save cost.');
+            avatar.destroy();
+            state.heygenReady = false;
+            
+            if (dom.avatarConnecting) {
+                dom.avatarConnecting.style.display = 'flex';
+                dom.avatarConnecting.innerHTML = '<span style="color:#a78bfa; font-size:14px; text-align:center;">🔌 Disconnected to save cost.<br>Tap Mic to wake up.</span>';
+            }
+            setStatus('offline', 'Sleep Mode');
+            dom.micLabel.textContent = 'Tap to wake & speak';
+        }
+    }, CONFIG.IDLE_DISCONNECT_MS);
+}
+
+function stopIdleTimer() {
+    if (state.idleTimer) clearTimeout(state.idleTimer);
+}
+
+// ============================================
 //  FORCE RESET STATE
 // ============================================
 function resetToReady() {
@@ -201,12 +223,27 @@ function resetToReady() {
     state.isSpeaking = false;
     state.isRecording = false;
     dom.micBtn.classList.remove('disabled', 'recording');
-    dom.micLabel.classList.remove('active');
-    dom.micLabel.textContent = 'Tap to speak';
+    
+    if (state.continuousMode) {
+        dom.micLabel.classList.add('active');
+        dom.micLabel.textContent = 'Auto-Conversation ON';
+    } else {
+        dom.micLabel.classList.remove('active');
+        dom.micLabel.textContent = 'Tap to speak';
+    }
+    
     setStatus('online', 'Ready');
     setMode('Idle');
     hideProcessing();
     if (avatar) avatar.setIdle();
+    resetIdleTimer();
+}
+
+function checkContinuousResume() {
+    if (state.continuousMode && !state.isRecording && !state.isSpeaking && !state.isProcessing) {
+        console.log('[App] Auto-resuming continuous mode...');
+        startRecording();
+    }
 }
 
 // ============================================
@@ -353,8 +390,21 @@ function getBestMimeType() {
 //  MICROPHONE RECORDING
 // ============================================
 async function startRecording() {
+    stopIdleTimer(); // Pause inactivity timer while user is active
+    
+    // If waking up from sleep, ensure UI says something helpful
+    if (dom.avatarConnecting && !state.heygenReady) {
+        dom.avatarConnecting.innerHTML = '<div class="spinner"></div><span>Waking up...</span>';
+        dom.avatarConnecting.style.display = 'flex';
+    }
+
     const ready = await ensureHeyGenSession();
-    if (!ready) return;
+    if (!ready) {
+        resetIdleTimer();
+        return;
+    }
+
+    if (dom.avatarConnecting) dom.avatarConnecting.style.display = 'none';
 
     try {
         const stream = await navigator.mediaDevices.getUserMedia({
@@ -368,6 +418,7 @@ async function startRecording() {
 
         state.stream = stream;
         state.audioChunks = [];
+        state.hasSpoken = false;
 
         if (!state.recognition) {
             const SpeechRec = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -381,6 +432,7 @@ async function startRecording() {
                         transcript += e.results[i][0].transcript;
                     }
                     if (transcript.trim()) {
+                        state.hasSpoken = true;
                         updateInterimMessage(transcript);
                     }
                 };
@@ -389,6 +441,46 @@ async function startRecording() {
         if (state.recognition) {
             try { state.recognition.start(); } catch(e){}
         }
+
+        // --- SILENCE DETECTION (VAD) ---
+        try {
+            const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            const analyser = audioCtx.createAnalyser();
+            const source = audioCtx.createMediaStreamSource(stream);
+            source.connect(analyser);
+            analyser.fftSize = 512;
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            
+            let lastSpeechTime = Date.now();
+            let startedSpeaking = false;
+            
+            const checkSilence = () => {
+                if (!state.isRecording) {
+                    audioCtx.close().catch(()=>{});
+                    return;
+                }
+                analyser.getByteFrequencyData(dataArray);
+                let sum = 0;
+                for (let i = 0; i < bufferLength; i++) sum += dataArray[i];
+                let average = sum / bufferLength;
+                
+                if (average > 12) { 
+                    startedSpeaking = true;
+                    state.hasSpoken = true;
+                    lastSpeechTime = Date.now();
+                } else if (startedSpeaking && Date.now() - lastSpeechTime > 2000) {
+                    console.log('[App] Silence detected, auto-stopping recording.');
+                    stopRecording();
+                    return;
+                }
+                requestAnimationFrame(checkSilence);
+            };
+            checkSilence();
+        } catch (e) {
+            console.warn('[App] AudioContext silence detection failed.', e);
+        }
+        // --------------------------------
 
         const mimeType = getBestMimeType();
         const recorderOptions = mimeType ? { mimeType } : {};
@@ -404,11 +496,15 @@ async function startRecording() {
 
         recorder.onstop = () => {
             const elapsed = Date.now() - state.recordingStartTime;
-            if (elapsed < CONFIG.MIN_RECORDING_MS) {
-                dom.micLabel.textContent = 'Too short, try again';
-                setTimeout(() => { dom.micLabel.textContent = 'Tap to speak'; }, 2000);
+            if (elapsed < CONFIG.MIN_RECORDING_MS || !state.hasSpoken) {
+                dom.micLabel.textContent = !state.hasSpoken ? 'No speech detected' : 'Too short';
+                setTimeout(() => { 
+                    if (state.continuousMode && !state.isSpeaking && !state.isProcessing) dom.micLabel.textContent = 'Auto-Conversation ON'; 
+                    else if (!state.continuousMode) dom.micLabel.textContent = 'Tap to speak'; 
+                }, 2000);
                 stopStream();
                 removeInterimMessage();
+                if (state.continuousMode) setTimeout(checkContinuousResume, 2000);
                 return;
             }
             const actualMime = recorder.mimeType || mimeType || 'audio/webm';
@@ -651,11 +747,7 @@ async function sendToN8N(audioBlob, mimeType = 'audio/webm') {
             removeInterimMessage();
             if (userText) addMessage('user', userText);
 
-            // Defer AI text until audio actually starts playing
-            let textShown = false;
             const showAiText = () => {
-                if (textShown) return;
-                textShown = true;
                 if (aiText) {
                     addMessage('ai', aiText);
                 } else {
@@ -676,21 +768,20 @@ async function sendToN8N(audioBlob, mimeType = 'audio/webm') {
                 } catch (playErr) {
                     console.error('[App] Audio playback error:', playErr);
                 }
-                
-                // Fallback: if audio failed to start, show text now
-                showAiText();
 
                 state.isSpeaking = false;
                 resetToReady();
+                checkContinuousResume();
             } else if (audioUrl) {
                 state.lastAudioUrl = audioUrl;
                 await playAudioFallback(audioUrl, showAiText);
-                showAiText();
                 resetToReady();
+                checkContinuousResume();
             } else {
-                console.warn('[App] No audioUrl in response');
                 showAiText();
+                console.warn('[App] No audioUrl in response');
                 resetToReady();
+                checkContinuousResume();
             }
 
             return; // Success — exit retry loop
@@ -723,34 +814,30 @@ async function sendToN8N(audioBlob, mimeType = 'audio/webm') {
 
     removeInterimMessage();
     resetToReady();
-    setTimeout(() => { dom.micLabel.textContent = 'Tap to speak'; }, 3000);
+    if (state.continuousMode) {
+        setTimeout(checkContinuousResume, 3000);
+    } else {
+        setTimeout(() => { dom.micLabel.textContent = 'Tap to speak'; }, 3000);
+    }
 }
 
 // ============================================
 //  AUDIO FALLBACK (when no avatar)
 // ============================================
-function playAudioFallback(audioUrl, onStartPlaybackCallback) {
+function playAudioFallback(audioUrl, onStart = null) {
     return new Promise((resolve) => {
         const audio = new Audio();
         // Add cache buster
         const separator = audioUrl.includes('?') ? '&' : '?';
         audio.src = `${audioUrl}${separator}_t=${Date.now()}`;
+        audio.volume = 0.6; // Control aggressive volume
 
         audio.addEventListener('canplay', () => {
+            if (onStart) onStart();
             setStatus('speaking', 'Speaking...');
             setMode('Speaking');
             if (avatar) avatar.setSpeaking(true);
-            
-            const p = audio.play();
-            if (p !== undefined) {
-                p.then(() => {
-                    if (typeof onStartPlaybackCallback === 'function') onStartPlaybackCallback();
-                }).catch(() => {
-                    resolve();
-                });
-            } else {
-                if (typeof onStartPlaybackCallback === 'function') onStartPlaybackCallback();
-            }
+            audio.play().catch(() => resolve());
         }, { once: true });
         audio.addEventListener('ended', () => {
             if (avatar) avatar.setIdle();
@@ -769,9 +856,24 @@ function playAudioFallback(audioUrl, onStartPlaybackCallback) {
 //  MIC BUTTON + KEYBOARD
 // ============================================
 dom.micBtn.addEventListener('click', () => {
-    if (state.isProcessing || state.isSpeaking) return;
-    if (state.isRecording) stopRecording();
-    else startRecording();
+    if (state.isProcessing || state.isSpeaking) {
+        if (state.continuousMode) {
+            state.continuousMode = false;
+            dom.micLabel.textContent = 'Conversation stopped.';
+            setStatus('online', 'Ready');
+            setTimeout(() => resetToReady(), 2000);
+            if (avatar) avatar.interrupt();
+        }
+        return;
+    }
+    
+    if (state.isRecording) {
+        state.continuousMode = false;
+        stopRecording();
+    } else {
+        state.continuousMode = true;
+        startRecording();
+    }
 });
 
 document.addEventListener('keydown', (e) => {
