@@ -1,44 +1,44 @@
 /**
  * ============================================
- *  Avatar Engine — Production-Ready v4
+ *  Avatar Engine — Simli WebRTC Integration v5
  * ============================================
  *
- * FIXED:
- *   — Safari & Chrome full compatibility
- *   — Video preloading to prevent first-message sync issues
- *   — Single video with native loop (no double-buffer overhead)
- *   — Idle-state FPS throttle (saves CPU/battery on mobile)
- *   — Cache-busting on audio URLs
- *   — Robust error recovery (never gets stuck)
- *   — Proper autoplay policy handling
+ * Replaces pre-recorded video + idle PNG with
+ * Simli's real-time avatar via WebRTC.
+ *
+ * Audio from n8n (ElevenLabs) is fetched, decoded
+ * to PCM16 16kHz, and streamed to Simli which
+ * returns lip-synced video of the avatar.
+ *
+ * Flow:
+ *   1. On page load → connect to Simli WebRTC
+ *   2. Simli streams idle avatar video to <video>
+ *   3. When n8n returns audioUrl → fetch audio →
+ *      decode to PCM16 16kHz → send chunks to Simli
+ *   4. Simli renders lip-synced video in real time
  */
 
-// ── Tuning Constants ──
-const CROSSFADE_MS = 250;
-const SILENCE_THRESHOLD = 0.04;
-const SPEECH_THRESHOLD = 0.06;
-const SILENCE_DELAY_MS = 150;
-const SPEECH_ATTACK_MS = 30;
-const ENERGY_SMOOTHING = 0.25;
-const VIDEO_SPEED_MIN = 0.9;
-const VIDEO_SPEED_MAX = 1.1;
-const STUCK_SAFETY_TIMEOUT_MS = 120000;
-const IDLE_FPS = 10;         // Throttle to 10fps when idle
-const SPEAKING_FPS = 60;     // Full 60fps when speaking
+// ── Simli Config ──
+const SIMLI_API_KEY = 'hiieoy2b3l6sv4scn5jwoo';
+const SIMLI_FACE_ID = 'e4fefd70-62b1-499d-bf6c-51c1a1d0501c';
+const SIMLI_API_URL = 'https://api.simli.ai';
+const SIMLI_WS_URL = 'wss://api.simli.ai';
+
+// Audio chunk settings — optimized for smooth Simli playback
+const AUDIO_CHUNK_SIZE = 3200;       // 3200 bytes = 100ms of 16kHz PCM16 mono — sweet spot
+const AUDIO_SAMPLE_RATE = 16000;     // Simli requires 16kHz PCM16
+const SEND_INTERVAL_MS = 25;         // send every 25ms — fast burst feeding
+const WS_BUFFER_THRESHOLD = 16000;   // pause sending if WebSocket buffer exceeds this
 
 class AvatarEngine {
     constructor() {
         this.avatarSection = document.getElementById('avatarSection');
-        this.canvas = document.getElementById('avatar-canvas');
-        if (this.canvas) {
-            this.ctx = this.canvas.getContext('2d', { alpha: false });
-        }
 
-        this.audioEl = document.getElementById('avatarAudio');
-        if (this.audioEl) {
-            this.audioEl.crossOrigin = 'anonymous';
-            this.audioEl.preload = 'auto';
-            this.audioEl.volume = 0.5; // Lower volume to control aggressiveness
+        // Simli uses <video> and <audio> elements directly (WebRTC streams)
+        this.videoEl = document.getElementById('simli-video');
+        this.audioOutEl = document.getElementById('simli-audio');
+        if (this.audioOutEl) {
+            this.audioOutEl.volume = 0.6; // Control aggressive volume
         }
 
         // State
@@ -46,299 +46,324 @@ class AvatarEngine {
         this.isThinking = false;
         this.sessionReady = false;
 
-        // Idle image
-        this.idleImage = null;
-        this.idleImageLoaded = false;
+        // Simli WebRTC connection
+        this.pc = null;                 // RTCPeerConnection
+        this.wsConnection = null;       // WebSocket for signaling + audio data
+        this.sessionToken = null;
         this._startPromise = null;
 
-        // Speaking video — single element with native loop
-        this.speakVideo = null;
-        this._videoReady = false;
-        this._videoReadyPromise = null;
+        // Audio sending state
+        this._sendingAudio = false;
+        this._interrupted = false;
 
-        // ── Audio analysis (Web Audio API) ──
+        // Wave bars (keep for visualizer)
+        this.waveBarElements = document.querySelectorAll('.wave-bar');
+
+        // For audio analysis (visualizer)
         this.audioContext = null;
         this.analyser = null;
         this.audioSource = null;
         this._sourceConnected = false;
         this.frequencyData = null;
-        this.timeDomainData = null;
         this.currentEnergy = 0;
-        this.rawEnergy = 0;
         this.isSpeechActive = false;
-        this.lastSpeechTime = 0;
-        this.lastSilenceStart = 0;
-        this.speechOnsetTime = 0;
 
-        // Lip sync blend
-        this.lipBlend = 0.0;
-        this.lipBlendTarget = 0.0;
-
-        // Idle ↔ speak crossfade
-        this.idleSpeakBlend = 0.0;
-        this.idleSpeakTarget = 0.0;
-        this.idleSpeakTransStart = 0;
-        this.idleSpeakTransFrom = 0;
-
-        // Wave bars
-        this.waveBarElements = null;
-
-        // Micro-motion
-        this._engineStartTime = performance.now();
-
-        // Animation
+        // Animation for wave bars
         this.animationFrameId = null;
-        this._lastFrameTime = 0;
-        this._targetFps = IDLE_FPS;
 
-        // Energy tracking
-        this._energyHistory = new Float32Array(8);
-        this._energyHistoryIdx = 0;
-        this._peakEnergy = 0.1;
-
-        // Safety timeout handle
+        // Safety timeout
         this._safetyTimer = null;
 
-        // Track if user has interacted (for autoplay)
-        this._userInteracted = false;
-        this._pendingVideoPlay = false;
-
-        this._initAssets();
+        console.log('[AvatarEngine] Simli integration v5 initialized');
     }
 
     // ────────────────────────────────────────
-    //  Load idle image + speaking video
+    //  Start Session — Connect to Simli
     // ────────────────────────────────────────
-    _initAssets() {
-        console.log('[AvatarEngine] Initializing v4 (production-ready)...');
+    async startSession() {
+        if (this.sessionReady) return true;
+        if (this._startPromise) return this._startPromise;
 
-        // Idle image
-        this.idleImage = new Image();
-        this.idleImage.onload = () => {
-            this.idleImageLoaded = true;
-            console.log('[AvatarEngine] Idle image loaded:', this.idleImage.width, '×', this.idleImage.height);
-            if (this.sessionReady) this._drawFirstFrame();
-        };
-        this.idleImage.onerror = (e) => {
-            console.error('[AvatarEngine] Failed to load idle image:', e);
-        };
-        this.idleImage.src = 'avatar_idle.png';
+        this._startPromise = (async () => {
+            try {
+                console.log('[AvatarEngine] Starting Simli session...');
 
-        // Speaking video — single element, native loop
-        this.speakVideo = this._createVideoElement('demo_test_4.mp4');
+                // Step 1: Get session token from Simli
+                const tokenRes = await fetch(`${SIMLI_API_URL}/compose/token`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'x-simli-api-key': SIMLI_API_KEY,
+                    },
+                    body: JSON.stringify({
+                        faceId: SIMLI_FACE_ID,
+                        handleSilence: true,
+                        maxSessionLength: 3600,
+                        maxIdleTime: 60, // Reduced from 300 to 60 for cost saving
+                    }),
+                });
 
-        // Pre-decode video for instant first-frame rendering
-        this._preDecodeVideo();
+                if (!tokenRes.ok) {
+                    const errText = await tokenRes.text();
+                    throw new Error(`Token request failed: ${tokenRes.status} - ${errText}`);
+                }
 
-        // Wave bar elements
-        this.waveBarElements = document.querySelectorAll('.wave-bar');
+                const tokenData = await tokenRes.json();
+                this.sessionToken = tokenData.session_token;
+                console.log('[AvatarEngine] Got session token:', this.sessionToken.substring(0, 20) + '...');
 
-        console.log('[AvatarEngine] Assets queued for loading');
+                // Step 2: Get ICE servers
+                let iceServers = [{ urls: ['stun:stun.l.google.com:19302'] }];
+                try {
+                    const iceRes = await fetch(`${SIMLI_API_URL}/compose/ice`, {
+                        method: 'GET',
+                        headers: {
+                            'x-simli-api-key': SIMLI_API_KEY,
+                        },
+                    });
+                    if (iceRes.ok) {
+                        iceServers = await iceRes.json();
+                        console.log('[AvatarEngine] Got ICE servers from Simli');
+                    }
+                } catch (e) {
+                    console.warn('[AvatarEngine] ICE server fetch failed, using STUN fallback');
+                }
+
+                // Step 3: Create WebRTC peer connection
+                const config = {
+                    sdpSemantics: 'unified-plan',
+                    iceServers: iceServers,
+                };
+
+                this.pc = new RTCPeerConnection(config);
+
+                // Listen for remote tracks (video + audio from Simli)
+                this.pc.addEventListener('track', (evt) => {
+                    console.log('[AvatarEngine] Received track:', evt.track.kind);
+                    if (evt.track.kind === 'video') {
+                        if (this.videoEl) {
+                            this.videoEl.srcObject = evt.streams[0];
+                            this.videoEl.play().catch(() => { });
+                            console.log('[AvatarEngine] Video stream attached');
+                        }
+                    } else if (evt.track.kind === 'audio') {
+                        if (this.audioOutEl) {
+                            this.audioOutEl.srcObject = evt.streams[0];
+                            this.audioOutEl.play().catch(() => { });
+                            console.log('[AvatarEngine] Audio stream attached');
+
+                            // Setup analyser for wave visualization
+                            this._setupAudioAnalyser(evt.streams[0]);
+                        }
+                    }
+                });
+
+                // ICE connection state
+                this.pc.addEventListener('iceconnectionstatechange', () => {
+                    console.log('[AvatarEngine] ICE state:', this.pc.iceConnectionState);
+                    if (this.pc.iceConnectionState === 'failed' || this.pc.iceConnectionState === 'disconnected') {
+                        console.warn('[AvatarEngine] ICE connection issue');
+                    }
+                });
+
+                // Add recv-only transceivers
+                this.pc.addTransceiver('audio', { direction: 'recvonly' });
+                this.pc.addTransceiver('video', { direction: 'recvonly' });
+
+                // Step 4: Create offer
+                const offer = await this.pc.createOffer();
+                await this.pc.setLocalDescription(offer);
+
+                // Wait for ICE gathering
+                await this._waitForIceGathering();
+
+                const localDesc = this.pc.localDescription;
+                console.log('[AvatarEngine] ICE gathering complete, connecting WebSocket...');
+
+                // Step 5: Connect via WebSocket
+                const wsURL = new URL(`${SIMLI_WS_URL}/compose/webrtc/p2p`);
+                wsURL.searchParams.set('session_token', this.sessionToken);
+
+                await this._connectWebSocket(wsURL.toString(), localDesc);
+
+                this.sessionReady = true;
+                this._startAnimationLoop();
+                console.log('[AvatarEngine] Simli session ready ✓');
+                return true;
+
+            } catch (err) {
+                console.error('[AvatarEngine] Session start failed:', err);
+                return false;
+            }
+        })();
+
+        try {
+            return await this._startPromise;
+        } finally {
+            this._startPromise = null;
+        }
     }
 
-    /**
-     * Create a single video element with native looping.
-     * Native loop avoids the double-buffer overhead and is smoother.
-     */
-    _createVideoElement(src) {
-        const video = document.createElement('video');
-        video.src = src;
-        video.loop = true;          // Native loop — smooth and simple
-        video.muted = true;
-        video.playsInline = true;
-        video.preload = 'auto';
-        video.setAttribute('playsinline', '');  // iOS Safari
-        video.setAttribute('webkit-playsinline', ''); // Older iOS
-        video.style.display = 'none';
-        document.body.appendChild(video);
-        video.load();
-        return video;
-    }
-
-    /**
-     * Pre-decode the video so first frame is ready instantly.
-     * This prevents the "audio plays but video doesn't show" issue.
-     */
-    _preDecodeVideo() {
-        if (!this.speakVideo) return;
-
-        this._videoReadyPromise = new Promise((resolve) => {
-            const onReady = () => {
-                this._videoReady = true;
-                console.log('[AvatarEngine] Video pre-decoded and ready');
-                resolve(true);
-            };
-
-            // If video is already loaded enough
-            if (this.speakVideo.readyState >= 3) {
-                onReady();
+    // ────────────────────────────────────────
+    //  Wait for ICE gathering to complete
+    // ────────────────────────────────────────
+    _waitForIceGathering() {
+        return new Promise((resolve) => {
+            if (this.pc.iceGatheringState === 'complete') {
+                resolve();
                 return;
             }
 
-            this.speakVideo.addEventListener('canplaythrough', onReady, { once: true });
+            let candidateCount = 0;
+            let lastCount = -1;
 
-            // Fallback: readyState >= 2 is good enough
-            this.speakVideo.addEventListener('canplay', () => {
-                if (!this._videoReady) {
-                    this._videoReady = true;
-                    console.log('[AvatarEngine] Video ready (canplay)');
-                    resolve(true);
+            const checkStable = () => {
+                if (this.pc.iceGatheringState === 'complete' || candidateCount === lastCount) {
+                    resolve();
+                } else {
+                    lastCount = candidateCount;
+                    setTimeout(checkStable, 250);
                 }
-            }, { once: true });
+            };
 
-            // Safety timeout — don't wait forever
-            setTimeout(() => {
-                if (!this._videoReady) {
-                    this._videoReady = this.speakVideo.readyState >= 2;
-                    console.log('[AvatarEngine] Video pre-decode timeout, readyState:', this.speakVideo.readyState);
-                    resolve(this._videoReady);
+            this.pc.addEventListener('icecandidate', (event) => {
+                if (event.candidate) {
+                    candidateCount++;
+                } else {
+                    // null candidate = gathering complete
+                    resolve();
                 }
-            }, 8000);
+            });
+
+            setTimeout(checkStable, 500);
+
+            // Safety: don't wait forever
+            setTimeout(resolve, 10000);
         });
     }
 
     // ────────────────────────────────────────
-    //  Web Audio API — Setup Analyser (ONCE)
+    //  Connect WebSocket for signaling + data
     // ────────────────────────────────────────
-    _setupAudioAnalyser() {
-        if (this.analyser) return;
+    _connectWebSocket(wsUrl, localDesc) {
+        return new Promise((resolve, reject) => {
+            const ws = new WebSocket(wsUrl);
+            this.wsConnection = ws;
 
+            let answerReceived = false;
+
+            ws.addEventListener('open', () => {
+                console.log('[AvatarEngine] WebSocket connected, sending SDP offer');
+                ws.send(JSON.stringify({
+                    sdp: localDesc.sdp,
+                    type: localDesc.type,
+                }));
+            });
+
+            ws.addEventListener('message', async (evt) => {
+                const data = evt.data;
+
+                if (data === 'START') {
+                    console.log('[AvatarEngine] Simli sent START signal');
+                    // Send minimal warmup silence (200ms worth, not 2 seconds)
+                    setTimeout(() => {
+                        if (this.wsConnection && this.wsConnection.readyState === WebSocket.OPEN) {
+                            this.wsConnection.send(new Uint8Array(6400)); // 200ms at 16kHz 16-bit
+                            console.log('[AvatarEngine] Sent warmup silence (200ms)');
+                        }
+                    }, 50);
+                    return;
+                }
+
+                if (data === 'STOP') {
+                    console.log('[AvatarEngine] Simli sent STOP signal');
+                    this.destroy();
+                    return;
+                }
+
+                // Try to parse as SDP answer
+                try {
+                    const message = JSON.parse(data);
+                    if (message.type === 'answer' && !answerReceived) {
+                        answerReceived = true;
+                        console.log('[AvatarEngine] Received SDP answer');
+                        await this.pc.setRemoteDescription(message);
+                        resolve();
+                    }
+                } catch (e) {
+                    // Not JSON, ignore
+                }
+            });
+
+            ws.addEventListener('error', (err) => {
+                console.error('[AvatarEngine] WebSocket error:', err);
+                reject(err);
+            });
+
+            ws.addEventListener('close', () => {
+                console.log('[AvatarEngine] WebSocket closed');
+            });
+
+            // Timeout
+            setTimeout(() => {
+                if (!answerReceived) {
+                    reject(new Error('WebSocket SDP answer timeout'));
+                }
+            }, 15000);
+        });
+    }
+
+    // ────────────────────────────────────────
+    //  Audio Analyser for wave visualization
+    // ────────────────────────────────────────
+    _setupAudioAnalyser(mediaStream) {
         try {
             const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-            if (!AudioContextClass) {
-                console.warn('[AvatarEngine] AudioContext not supported');
-                return;
-            }
+            if (!AudioContextClass) return;
+
             this.audioContext = new AudioContextClass();
             this.analyser = this.audioContext.createAnalyser();
             this.analyser.fftSize = 256;
             this.analyser.smoothingTimeConstant = 0.8;
-
             this.frequencyData = new Uint8Array(this.analyser.frequencyBinCount);
-            this.timeDomainData = new Uint8Array(this.analyser.fftSize);
 
-            console.log('[AvatarEngine] Audio analyser created');
+            const source = this.audioContext.createMediaStreamSource(mediaStream);
+            source.connect(this.analyser);
+            // Don't connect to destination — the <audio> element handles playback
+            this._sourceConnected = true;
+            console.log('[AvatarEngine] Audio analyser connected');
         } catch (e) {
-            console.error('[AvatarEngine] Failed to create AudioContext:', e);
+            console.warn('[AvatarEngine] Audio analyser setup failed:', e);
         }
     }
 
-    /**
-     * Connect the audio element to the analyser.
-     * createMediaElementSource() can only be called ONCE per audio element.
-     */
-    _connectAudioSource() {
-        if (!this.audioContext || !this.analyser || !this.audioEl) return;
+    // ────────────────────────────────────────
+    //  Animation loop (for wave bars)
+    // ────────────────────────────────────────
+    _startAnimationLoop() {
+        if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId);
 
-        // Resume context if suspended (Safari/Chrome autoplay policy)
-        if (this.audioContext.state === 'suspended') {
-            this.audioContext.resume().catch(() => {});
-        }
+        const loop = () => {
+            this._updateWaveBars();
+            this.animationFrameId = requestAnimationFrame(loop);
+        };
+        this.animationFrameId = requestAnimationFrame(loop);
+    }
 
-        if (!this._sourceConnected) {
-            try {
-                this.audioSource = this.audioContext.createMediaElementSource(this.audioEl);
-                this.audioSource.connect(this.analyser);
-                this.analyser.connect(this.audioContext.destination);
-                this._sourceConnected = true;
-                console.log('[AvatarEngine] Audio source connected');
-            } catch (e) {
-                // Safari sometimes errors on createMediaElementSource
-                // Fall back to playing without analysis
-                console.warn('[AvatarEngine] Audio source connection failed (will play without lip analysis):', e.message);
-                this._sourceConnected = false;
+    _updateWaveBars() {
+        if (!this.waveBarElements || this.waveBarElements.length === 0) return;
+
+        if (!this.isSpeaking || !this.analyser || !this.frequencyData) {
+            for (let i = 0; i < this.waveBarElements.length; i++) {
+                this.waveBarElements[i].style.transform = 'scaleY(0.15)';
+                this.waveBarElements[i].style.opacity = '0.3';
             }
-        }
-    }
-
-    // ────────────────────────────────────────
-    //  Analyze current audio frame
-    // ────────────────────────────────────────
-    _analyzeAudio(now) {
-        if (!this.analyser || !this.isSpeaking) {
-            this.currentEnergy = 0;
-            this.rawEnergy = 0;
             return;
         }
 
         try {
             this.analyser.getByteFrequencyData(this.frequencyData);
-            this.analyser.getByteTimeDomainData(this.timeDomainData);
         } catch (e) {
-            return;
-        }
-
-        // RMS energy from time domain
-        let sumSquares = 0;
-        for (let i = 0; i < this.timeDomainData.length; i++) {
-            const normalized = (this.timeDomainData[i] - 128) / 128;
-            sumSquares += normalized * normalized;
-        }
-        const rmsEnergy = Math.sqrt(sumSquares / this.timeDomainData.length);
-
-        // Spectral energy weighted toward speech frequencies
-        let speechBandEnergy = 0;
-        const speechStart = 2;
-        const speechEnd = Math.min(18, this.frequencyData.length);
-        for (let i = speechStart; i < speechEnd; i++) {
-            speechBandEnergy += this.frequencyData[i] / 255;
-        }
-        speechBandEnergy /= (speechEnd - speechStart);
-
-        this.rawEnergy = Math.max(rmsEnergy, speechBandEnergy * 0.8);
-
-        // Peak tracking
-        if (this.rawEnergy > this._peakEnergy) this._peakEnergy = this.rawEnergy;
-        this._peakEnergy *= 0.9995;
-        this._peakEnergy = Math.max(this._peakEnergy, 0.1);
-
-        const normalizedEnergy = Math.min(1.0, this.rawEnergy / this._peakEnergy);
-        this.currentEnergy += (normalizedEnergy - this.currentEnergy) * ENERGY_SMOOTHING;
-
-        // Speech detection with hysteresis
-        if (this.rawEnergy > SPEECH_THRESHOLD) {
-            this.lastSpeechTime = now;
-            if (!this.isSpeechActive) {
-                this.isSpeechActive = true;
-                this.speechOnsetTime = now;
-            }
-        } else if (this.rawEnergy < SILENCE_THRESHOLD) {
-            if (this.isSpeechActive && now - this.lastSpeechTime > SILENCE_DELAY_MS) {
-                this.isSpeechActive = false;
-            }
-        }
-
-        // Lip blend target
-        if (this.isSpeechActive) {
-            const timeSinceOnset = now - this.speechOnsetTime;
-            const attackProgress = Math.min(1.0, timeSinceOnset / SPEECH_ATTACK_MS);
-            this.lipBlendTarget = attackProgress * Math.min(1.0, this.currentEnergy * 2.5);
-        } else {
-            this.lipBlendTarget = 0.0;
-        }
-
-        // Video playback speed
-        if (this.speakVideo && this.isSpeechActive) {
-            const speedRange = VIDEO_SPEED_MAX - VIDEO_SPEED_MIN;
-            const targetSpeed = VIDEO_SPEED_MIN + speedRange * Math.min(1.0, this.currentEnergy * 2.0);
-            try {
-                this.speakVideo.playbackRate = targetSpeed;
-            } catch (e) {
-                // Safari can throw on playbackRate changes
-            }
-        }
-    }
-
-    // ────────────────────────────────────────
-    //  Wave bar visualization
-    // ────────────────────────────────────────
-    _updateWaveBars() {
-        if (!this.waveBarElements || this.waveBarElements.length === 0) return;
-        if (!this.isSpeaking || !this.frequencyData) {
-            for (let i = 0; i < this.waveBarElements.length; i++) {
-                this.waveBarElements[i].style.transform = 'scaleY(0.15)';
-                this.waveBarElements[i].style.opacity = '0.3';
-            }
             return;
         }
 
@@ -350,406 +375,162 @@ class AvatarEngine {
                 sum += this.frequencyData[j];
             }
             const avg = sum / binsPerBar / 255;
-            const scale = this.isSpeechActive ? (0.15 + avg * 0.85) : (0.15 + avg * 0.1);
-            const opacity = this.isSpeechActive ? (0.5 + avg * 0.5) : 0.3;
+            const scale = 0.15 + avg * 0.85;
+            const opacity = 0.5 + avg * 0.5;
             this.waveBarElements[i].style.transform = `scaleY(${scale.toFixed(3)})`;
             this.waveBarElements[i].style.opacity = opacity.toFixed(2);
         }
     }
 
     // ────────────────────────────────────────
-    //  Start Session
+    //  Play Audio — Fetch, decode to PCM16, send to Simli
     // ────────────────────────────────────────
-    async startSession() {
-        if (this.sessionReady) return true;
-        if (this._startPromise) return this._startPromise;
+    async playAudioSync(audioUrl, onStart = null) {
+        if (!this.wsConnection || this.wsConnection.readyState !== WebSocket.OPEN) {
+            console.warn('[AvatarEngine] WebSocket not connected, cannot send audio');
+            return;
+        }
 
-        this._startPromise = (async () => {
-            console.log('[AvatarEngine] Starting session...');
-            this.sessionReady = true;
+        console.log('[AvatarEngine] playAudioSync called:', audioUrl);
 
-            if (!this.idleImageLoaded) {
-                await new Promise((resolve) => {
-                    const check = () => {
-                        if (this.idleImageLoaded) return resolve();
-                        setTimeout(check, 50);
-                    };
-                    check();
-                    setTimeout(resolve, 5000);
-                });
-            }
+        // Add cache-busting
+        const separator = audioUrl.includes('?') ? '&' : '?';
+        const freshUrl = `${audioUrl}${separator}_cb=${Date.now()}`;
 
-            this._setupAudioAnalyser();
-            this._drawFirstFrame();
-            this._engineStartTime = performance.now();
-            this.startLoop();
-
-            console.log('[AvatarEngine] Session ready ✓');
-            return true;
-        })();
+        this._interrupted = false;
+        this._goSpeaking();
 
         try {
-            return await this._startPromise;
-        } finally {
-            this._startPromise = null;
-        }
-    }
+            // Fetch the audio file
+            const t0 = performance.now();
+            console.log('[AvatarEngine] Fetching audio...');
+            const response = await fetch(freshUrl);
+            if (!response.ok) throw new Error(`Audio fetch failed: ${response.status}`);
 
-    _drawFirstFrame() {
-        if (!this.ctx || !this.idleImageLoaded) return;
-        const container = this.canvas.parentElement;
-        const containerW = container ? container.clientWidth : 420;
-        const containerH = container ? container.clientHeight : 420;
-        const dpr = Math.min(window.devicePixelRatio || 1, 2); // Cap DPR at 2 for performance
-        this.canvas.width = Math.round(containerW * dpr);
-        this.canvas.height = Math.round(containerH * dpr);
-        this._drawCover(this.idleImage, this.canvas.width, this.canvas.height);
-        console.log('[AvatarEngine] First frame drawn (idle PNG)');
-    }
+            const arrayBuffer = await response.arrayBuffer();
+            console.log(`[AvatarEngine] Audio fetched: ${(arrayBuffer.byteLength / 1024).toFixed(1)}KB in ${(performance.now() - t0).toFixed(0)}ms`);
 
-    // ────────────────────────────────────────
-    //  Render Loop with FPS throttling
-    // ────────────────────────────────────────
-    startLoop() {
-        if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId);
-        const loop = (timestamp) => {
-            // FPS throttle: skip frames when idle to save CPU
-            const elapsed = timestamp - this._lastFrameTime;
-            const frameInterval = 1000 / this._targetFps;
+            // Decode to raw audio
+            const audioCtx = this.audioContext || new (window.AudioContext || window.webkitAudioContext)();
+            const audioBuffer = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+            const audioDurationMs = audioBuffer.duration * 1000;
 
-            if (elapsed >= frameInterval) {
-                this._lastFrameTime = timestamp - (elapsed % frameInterval);
-                this._analyzeAudio(timestamp);
-                this._update(timestamp);
-                this._updateWaveBars();
-                this._draw(timestamp);
+            console.log(`[AvatarEngine] Audio decoded: ${audioBuffer.duration.toFixed(2)}s, ${audioBuffer.sampleRate}Hz`);
+
+            // Convert to PCM16 at 16kHz mono
+            const pcm16Data = this._audioBufToPCM16(audioBuffer);
+            console.log(`[AvatarEngine] PCM16 data: ${(pcm16Data.byteLength / 1024).toFixed(1)}KB`);
+
+            // ── EXACT REAL-TIME STREAMING — 1x Speed ──
+            // Simli lip-sync expects audio streamed at real-time (like a microphone) to generate smooth WebRTC video frames.
+            const uint8 = new Uint8Array(pcm16Data);
+            const CHUNK_SIZE = 3200; // 100ms of PCM16 16kHz Mono
+            const CHUNK_DURATION_MS = 100;
+            const totalChunks = Math.ceil(uint8.length / CHUNK_SIZE);
+            let offset = 0;
+            let chunksSent = 0;
+            const sendStart = performance.now();
+
+            console.log(`[AvatarEngine] Streaming ${totalChunks} chunks (${CHUNK_SIZE}B each, ${CHUNK_DURATION_MS}ms) at 1x real-time to Simli...`);
+
+            while (offset < uint8.length) {
+                if (this._interrupted || !this.wsConnection || this.wsConnection.readyState !== WebSocket.OPEN) {
+                    console.warn('[AvatarEngine] Send aborted (interrupted or WS closed)');
+                    break;
+                }
+
+                if (chunksSent === 0 && onStart) {
+                    onStart();
+                }
+
+                const end = Math.min(offset + CHUNK_SIZE, uint8.length);
+                const chunk = uint8.subarray(offset, end);
+                this.wsConnection.send(chunk);
+                offset = end;
+                chunksSent++;
+
+                // Wait exactly until the NEXT chunk is due (1x real-time pacing)
+                const targetTime = sendStart + (chunksSent * CHUNK_DURATION_MS);
+                const delay = targetTime - performance.now();
+                if (delay > 0) {
+                    await new Promise(r => setTimeout(r, delay));
+                }
             }
 
-            this.animationFrameId = requestAnimationFrame(loop);
-        };
-        this.animationFrameId = requestAnimationFrame(loop);
-    }
+            const sendElapsed = performance.now() - sendStart;
+            console.log(`[AvatarEngine] All ${chunksSent} chunks streamed in ${sendElapsed.toFixed(0)}ms`);
 
-    _easeInOutCubic(t) {
-        return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
-    }
+            // Audio is already mostly played during the streaming loop.
+            // Just wait a tiny bit for the final WebRTC frames to arrive.
+            const remainingWait = 500;
+            console.log(`[AvatarEngine] Waiting ${(remainingWait / 1000).toFixed(1)}s for tail playback...`);
 
-    // ────────────────────────────────────────
-    //  UPDATE
-    // ────────────────────────────────────────
-    _update(now) {
-        // Main crossfade (idle ↔ speaking)
-        if (this.idleSpeakBlend !== this.idleSpeakTarget) {
-            const elapsed = now - this.idleSpeakTransStart;
-            const progress = Math.min(1.0, elapsed / CROSSFADE_MS);
-            const eased = this._easeInOutCubic(progress);
-            this.idleSpeakBlend = this.idleSpeakTransFrom +
-                (this.idleSpeakTarget - this.idleSpeakTransFrom) * eased;
-            if (progress >= 1.0) this.idleSpeakBlend = this.idleSpeakTarget;
-        }
-
-        // Lip blend: spring-like smoothing
-        const lipDiff = this.lipBlendTarget - this.lipBlend;
-        if (this.isSpeechActive) {
-            this.lipBlend += lipDiff * 0.35;
-        } else {
-            this.lipBlend += lipDiff * 0.15;
-        }
-        this.lipBlend = Math.max(0, Math.min(1, this.lipBlend));
-
-        // Keep video playing during speaking (handle Safari pauses)
-        if (this.isSpeaking && this.speakVideo && this.speakVideo.paused) {
-            this.speakVideo.play().catch(() => {});
-        }
-
-        // If audio source not connected (Safari fallback), simulate energy from audio time
-        if (this.isSpeaking && !this._sourceConnected && this.audioEl && !this.audioEl.paused) {
-            // Simulate speaking energy so video shows even without Web Audio analysis
-            const t = performance.now() / 200;
-            this.lipBlendTarget = 0.5 + 0.3 * Math.sin(t) + 0.2 * Math.sin(t * 2.7);
-            this.isSpeechActive = true;
-            this.currentEnergy = this.lipBlendTarget;
-        }
-    }
-
-    // ────────────────────────────────────────
-    //  DRAW
-    // ────────────────────────────────────────
-    _draw(now) {
-        if (!this.ctx) return;
-
-        const container = this.canvas.parentElement;
-        const containerW = container ? container.clientWidth : 420;
-        const containerH = container ? container.clientHeight : 420;
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        const targetW = Math.round(containerW * dpr);
-        const targetH = Math.round(containerH * dpr);
-
-        if (this.canvas.width !== targetW || this.canvas.height !== targetH) {
-            this.canvas.width = targetW;
-            this.canvas.height = targetH;
-        }
-
-        const w = this.canvas.width;
-        const h = this.canvas.height;
-
-        const t = now - this._engineStartTime;
-        const breathePhase = (t / 3500) * Math.PI * 2;
-        const baseScale = 1.0 + Math.sin(breathePhase) * 0.0015;
-        const yOff = Math.sin(breathePhase + 0.3) * 0.4;
-        const swayPhase = (t / 5200) * Math.PI * 2;
-        const xOff = Math.sin(swayPhase) * 0.25;
-
-        const isVideoDrawable = (v) => !!(v && v.videoWidth > 0 && v.readyState >= 2);
-        const idleReady = this.idleImageLoaded;
-        const primaryReady = isVideoDrawable(this.speakVideo);
-
-        if (!idleReady && !primaryReady) return;
-
-        this.ctx.fillStyle = '#0a0a14';
-        this.ctx.fillRect(0, 0, w, h);
-
-        this.ctx.save();
-        const cx = w / 2;
-        const cy = h / 2;
-        this.ctx.translate(cx + xOff, cy + yOff);
-        this.ctx.scale(baseScale, baseScale);
-        this.ctx.translate(-cx, -cy);
-
-        let effectiveBlend;
-        if (this.isSpeaking && primaryReady) {
-            effectiveBlend = this.idleSpeakBlend * (0.15 + 0.85 * this.lipBlend);
-        } else {
-            effectiveBlend = primaryReady ? this.idleSpeakBlend : 0;
-        }
-
-        // Draw idle image
-        if (effectiveBlend < 0.999 && idleReady) {
-            this.ctx.globalAlpha = 1.0 - effectiveBlend;
-            this._drawCover(this.idleImage, w, h);
-        }
-
-        // Draw speaking video
-        if (effectiveBlend > 0.001 && primaryReady) {
-            this.ctx.globalAlpha = effectiveBlend;
-            this._drawCover(this.speakVideo, w, h);
-        }
-
-        this.ctx.globalAlpha = 1.0;
-        this.ctx.restore();
-    }
-
-    // ────────────────────────────────────────
-    //  Cover-fit draw
-    // ────────────────────────────────────────
-    _drawCover(source, canvasW, canvasH) {
-        const vw = source.videoWidth || source.naturalWidth || source.width;
-        const vh = source.videoHeight || source.naturalHeight || source.height;
-        if (!vw || !vh) return;
-
-        const videoAspect = vw / vh;
-        const canvasAspect = canvasW / canvasH;
-        let srcX, srcY, srcW, srcH;
-
-        if (videoAspect > canvasAspect) {
-            srcH = vh; srcW = vh * canvasAspect;
-            srcX = (vw - srcW) / 2; srcY = 0;
-        } else {
-            srcW = vw; srcH = vw / canvasAspect;
-            srcX = 0; srcY = (vh - srcH) * 0.15;
-        }
-
-        const zoom = 1.02;
-        const zx = canvasW * (zoom - 1) / 2;
-        const zy = canvasH * (zoom - 1) / 2;
-        this.ctx.drawImage(source, srcX, srcY, srcW, srcH, -zx, -zy, canvasW * zoom, canvasH * zoom);
-    }
-
-    // ────────────────────────────────────────
-    //  Play Audio + Speaking Video
-    // ────────────────────────────────────────
-    async playAudioSync(audioUrl, onStartPlaybackCallback) {
-        return new Promise(async (resolve) => {
-            if (!this.audioEl) {
-                console.warn('[AvatarEngine] No audio element found!');
-                return resolve();
-            }
-
-            // Add cache-busting to prevent stale audio
-            const cacheBuster = `_cb=${Date.now()}`;
-            const separator = audioUrl.includes('?') ? '&' : '?';
-            const freshUrl = `${audioUrl}${separator}${cacheBuster}`;
-
-            console.log('[AvatarEngine] playAudioSync called with:', freshUrl);
-
-            // Wait for video to be ready before starting (prevents audio-only on first message)
-            if (!this._videoReady && this._videoReadyPromise) {
-                console.log('[AvatarEngine] Waiting for video pre-decode...');
-                await Promise.race([
-                    this._videoReadyPromise,
-                    new Promise(r => setTimeout(r, 3000)) // Don't wait more than 3s
-                ]);
-            }
-
-            let settled = false;
-            let noCorsRetried = false;
-            let speakingStarted = false;
-
-            const finish = () => {
-                if (settled) return;
-                settled = true;
-                if (this._safetyTimer) {
-                    clearTimeout(this._safetyTimer);
+            await new Promise((resolve) => {
+                this._safetyTimer = setTimeout(() => {
                     this._safetyTimer = null;
-                }
-                this.setIdle();
-                resolve();
-            };
+                    resolve();
+                }, remainingWait);
+            });
 
-            // Safety timeout
-            this._safetyTimer = setTimeout(() => {
-                if (!settled) {
-                    console.warn('[AvatarEngine] ⚠ Safety timeout! Forcing idle.');
-                    finish();
-                }
-            }, STUCK_SAFETY_TIMEOUT_MS);
-
-            const startSpeaking = () => {
-                if (speakingStarted) return;
-                speakingStarted = true;
-                if (typeof onStartPlaybackCallback === 'function') onStartPlaybackCallback();
-                this._connectAudioSource();
-                this._goSpeaking();
-            };
-
-            const tryPlay = () => {
-                const playPromise = this.audioEl.play();
-                if (playPromise && playPromise.then) {
-                    playPromise.then(() => {
-                        startSpeaking();
-                    }).catch((e) => {
-                        console.warn('[AvatarEngine] Audio play() failed:', e.message);
-                        // Safari: might need user gesture — still start speaking visuals
-                        if (e.name === 'NotAllowedError') {
-                            console.log('[AvatarEngine] Autoplay blocked — will retry on interaction');
-                            this._pendingVideoPlay = true;
-                        }
-                        setTimeout(() => {
-                            if (!settled) finish();
-                        }, 2000);
-                    });
-                }
-            };
-
-            // Clear previous handlers
-            this.audioEl.oncanplaythrough = null;
-            this.audioEl.oncanplay = null;
-            this.audioEl.onended = null;
-            this.audioEl.onerror = null;
-            this.audioEl.onplaying = null;
-            this.audioEl.onloadeddata = null;
-
-            this.audioEl.pause();
-            this.audioEl.currentTime = 0;
-
-            // Try with CORS first, fallback without
-            this.audioEl.crossOrigin = 'anonymous';
-            this.audioEl.src = freshUrl;
-
-            console.log('[AvatarEngine] Loading audio...');
-
-            this.audioEl.onloadeddata = () => {
-                console.log('[AvatarEngine] Audio loaded, duration:', this.audioEl.duration?.toFixed(2) + 's');
-            };
-
-            this.audioEl.oncanplay = () => {
-                if (!speakingStarted) tryPlay();
-            };
-
-            this.audioEl.onended = () => {
-                console.log('[AvatarEngine] Audio ended → idle');
-                finish();
-            };
-
-            this.audioEl.onerror = (e) => {
-                const err = this.audioEl.error;
-                console.error('[AvatarEngine] Audio error:', err ? `code=${err.code} message=${err.message}` : e);
-
-                // CORS errors: retry without crossOrigin (common on Safari)
-                if (this.audioEl.crossOrigin === 'anonymous' && !noCorsRetried) {
-                    noCorsRetried = true;
-                    console.log('[AvatarEngine] Retrying without crossOrigin...');
-                    this.audioEl.crossOrigin = '';
-                    this.audioEl.removeAttribute('crossorigin');
-                    this.audioEl.src = freshUrl;
-                    this.audioEl.load();
-                    // When CORS is removed, we can't use Web Audio API
-                    // but audio will still play
-                    setTimeout(() => {
-                        if (!speakingStarted) {
-                            this.audioEl.play().then(() => {
-                                startSpeaking();
-                            }).catch(() => {
-                                if (!settled) finish();
-                            });
-                        }
-                    }, 300);
-                    return;
-                }
-                finish();
-            };
-
-            this.audioEl.onplaying = () => {
-                console.log(`[AvatarEngine] Audio playing: duration=${(this.audioEl.duration * 1000).toFixed(0)}ms`);
-                startSpeaking();
-            };
-
-            this.audioEl.load();
-
-            // Safety: try to play after a short delay
-            setTimeout(() => {
-                if (!speakingStarted && !settled) tryPlay();
-            }, 200);
-        });
+        } catch (err) {
+            console.error('[AvatarEngine] Audio processing error:', err);
+        } finally {
+            this._goIdle();
+        }
     }
 
     // ────────────────────────────────────────
-    //  Speaking mode
+    //  Convert AudioBuffer to PCM16 Int16 at 16kHz mono
+    // ────────────────────────────────────────
+    _audioBufToPCM16(audioBuffer) {
+        const sourceSampleRate = audioBuffer.sampleRate;
+        const targetSampleRate = AUDIO_SAMPLE_RATE;
+
+        // Get mono channel data
+        let channelData;
+        if (audioBuffer.numberOfChannels === 1) {
+            channelData = audioBuffer.getChannelData(0);
+        } else {
+            // Mix to mono
+            const ch0 = audioBuffer.getChannelData(0);
+            const ch1 = audioBuffer.getChannelData(1);
+            channelData = new Float32Array(ch0.length);
+            for (let i = 0; i < ch0.length; i++) {
+                channelData[i] = (ch0[i] + ch1[i]) / 2;
+            }
+        }
+
+        // Resample to 16kHz
+        const ratio = sourceSampleRate / targetSampleRate;
+        const targetLength = Math.floor(channelData.length / ratio);
+        const result = new Int16Array(targetLength);
+
+        for (let i = 0; i < targetLength; i++) {
+            const srcIndex = i * ratio;
+            const srcFloor = Math.floor(srcIndex);
+            const srcCeil = Math.min(srcFloor + 1, channelData.length - 1);
+            const frac = srcIndex - srcFloor;
+
+            // Linear interpolation
+            const sample = channelData[srcFloor] * (1 - frac) + channelData[srcCeil] * frac;
+
+            // Clamp and convert to Int16
+            const clamped = Math.max(-1, Math.min(1, sample));
+            result[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+        }
+
+        return result.buffer;
+    }
+
+    // ────────────────────────────────────────
+    //  Speaking/Idle state management
     // ────────────────────────────────────────
     _goSpeaking() {
         if (this.isSpeaking) return;
         this.isSpeaking = true;
         this.isThinking = false;
 
-        // Boost FPS for smooth animation
-        this._targetFps = SPEAKING_FPS;
-
         console.log('[AvatarEngine] → Speaking');
-
-        // Reset lip sync state
-        this.lipBlend = 0;
-        this.lipBlendTarget = 0;
-        this.isSpeechActive = false;
-        this.lastSpeechTime = 0;
-        this._peakEnergy = 0.1;
-        this._energyHistory.fill(0);
-
-        // Start video from beginning
-        if (this.speakVideo) {
-            this.speakVideo.currentTime = 0;
-            this.speakVideo.playbackRate = 1.0;
-            this.speakVideo.play().catch((e) => {
-                console.warn('[AvatarEngine] Video play error:', e.message);
-            });
-        }
-
-        if (this.audioContext && this.audioContext.state === 'suspended') {
-            this.audioContext.resume().catch(() => {});
-        }
-
-        this.idleSpeakTransFrom = this.idleSpeakBlend;
-        this.idleSpeakTarget = 1.0;
-        this.idleSpeakTransStart = performance.now();
 
         if (this.avatarSection) {
             this.avatarSection.classList.add('speaking');
@@ -757,32 +538,13 @@ class AvatarEngine {
         }
     }
 
-    // ────────────────────────────────────────
-    //  Idle mode
-    // ────────────────────────────────────────
     _goIdle() {
         this.isSpeaking = false;
         this.isThinking = false;
         this.isSpeechActive = false;
-        this.lipBlend = 0;
-        this.lipBlendTarget = 0;
         this.currentEnergy = 0;
-        this.rawEnergy = 0;
-
-        // Throttle FPS when idle to save CPU/battery
-        this._targetFps = IDLE_FPS;
-
-        // Pause video
-        if (this.speakVideo) {
-            this.speakVideo.pause();
-            this.speakVideo.playbackRate = 1.0;
-        }
 
         this._updateWaveBars();
-
-        this.idleSpeakTransFrom = this.idleSpeakBlend;
-        this.idleSpeakTarget = 0.0;
-        this.idleSpeakTransStart = performance.now();
 
         if (this.avatarSection) {
             this.avatarSection.classList.remove('speaking');
@@ -793,7 +555,7 @@ class AvatarEngine {
     }
 
     // ────────────────────────────────────────
-    //  Public API
+    //  Public API (same interface as before)
     // ────────────────────────────────────────
     setSpeaking(val) { val ? this._goSpeaking() : this._goIdle(); }
 
@@ -810,44 +572,76 @@ class AvatarEngine {
     stopLipSync() { this._goIdle(); }
 
     resumePlayback() {
-        if (this.audioEl && this.audioEl.paused && this.audioEl.src) {
-            this.audioEl.play().catch(() => {});
+        if (this.videoEl && this.videoEl.paused) {
+            this.videoEl.play().catch(() => { });
         }
-        if (this.isSpeaking && this.speakVideo && this.speakVideo.paused) {
-            this.speakVideo.play().catch(() => {});
+        if (this.audioOutEl && this.audioOutEl.paused) {
+            this.audioOutEl.play().catch(() => { });
         }
-        // Handle pending autoplay
-        if (this._pendingVideoPlay && this.audioEl) {
-            this._pendingVideoPlay = false;
-            this.audioEl.play().catch(() => {});
+        if (this.audioContext && this.audioContext.state === 'suspended') {
+            this.audioContext.resume().catch(() => { });
         }
     }
 
-    smile() {}
+    smile() { }
 
     async speak(text) {
         console.warn('[AvatarEngine] speak(text) needs audioUrl. Use playAudioSync().');
     }
 
     interrupt() {
-        if (this.audioEl) {
-            this.audioEl.pause();
-            this.audioEl.currentTime = 0;
+        this._interrupted = true;
+
+        // Clear audio buffer on Simli
+        if (this.wsConnection && this.wsConnection.readyState === WebSocket.OPEN) {
+            this.wsConnection.send('SKIP');
         }
+
         if (this._safetyTimer) {
             clearTimeout(this._safetyTimer);
             this._safetyTimer = null;
         }
+
         this._goIdle();
     }
 
     async destroy() {
         this.interrupt();
         if (this.animationFrameId) cancelAnimationFrame(this.animationFrameId);
-        if (this.speakVideo) { this.speakVideo.pause(); this.speakVideo.remove(); }
-        if (this.audioContext) {
-            try { this.audioContext.close(); } catch (e) {}
+
+        // Close WebSocket
+        if (this.wsConnection) {
+            try {
+                this.wsConnection.send('DONE');
+            } catch (e) { }
+            this.wsConnection.close();
+            this.wsConnection = null;
         }
+
+        // Close peer connection
+        if (this.pc) {
+            try {
+                if (this.pc.getTransceivers) {
+                    this.pc.getTransceivers().forEach((t) => {
+                        if (t.stop) t.stop();
+                    });
+                }
+                this.pc.getSenders().forEach((sender) => {
+                    if (sender.track) sender.track.stop();
+                });
+                this.pc.close();
+            } catch (e) { }
+            this.pc = null;
+        }
+
+        if (this.audioContext) {
+            try { this.audioContext.close(); } catch (e) { }
+            this.audioContext = null;
+        }
+
+        this.sessionReady = false;
+        this._startPromise = null; // Allows re-initializing later
+        console.log('[AvatarEngine] Destroyed');
     }
 }
 
